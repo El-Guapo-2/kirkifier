@@ -1,7 +1,0 @@
-[project]
-name = "kirkifier"
-version = "0.1.0"
-description = " kirkifies any picture or video you give it "
-readme = "README.md"
-requires-python = ">=3.13"
-dependencies = []
