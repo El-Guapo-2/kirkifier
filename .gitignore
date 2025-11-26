@@ -8,7 +8,11 @@ wheels/
 
 # Virtual environments
 .venv
-processed_frames/*
-unprocessed_frames/*
-inswapper_128.onnx
+uv.lock
+pyproject.toml
+
+processed_frames/
+unprocessed_frames/
 tests/
+
+inswapper_128.onnx
