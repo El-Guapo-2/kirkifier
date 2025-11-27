@@ -2,6 +2,22 @@ import sys
 import os
 
 from subprocess import run
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from shutil import rmtree
+from pathlib import Path
+from random import randint
+from contextlib import contextmanager
+from tqdm import tqdm
+
+os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
+import insightface
+from insightface.app import FaceAnalysis
+from cv2 import imread, imwrite, VideoCapture, CAP_PROP_FPS
+import sys
+import os
+
+from subprocess import run
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from shutil import rmtree
 from pathlib import Path
 from random import randint
@@ -13,100 +29,173 @@ import insightface
 from insightface.app import FaceAnalysis
 from cv2 import imread, imwrite, VideoCapture, CAP_PROP_FPS
 
+# Constant directories
+UNPROCESSED_DIR = Path('unprocessed_frames')
+PROCESSED_DIR = Path('processed_frames')
+KIRKS_DIR = Path('kirks')
+
+# Utilities for ONNX Runtime/GPU verification
+def ort_available_and_providers() -> tuple[bool, list[str]]:
+    try:
+        import onnxruntime as ort  # type: ignore
+        try:
+            # If directory is not provided, it will auto-search in site-packages/nvidia/...
+            ort.preload_dlls()
+            print("[INFO] CUDA DLLs preloaded from nvidia-* wheels")
+        except Exception as e:
+            print("[WARN] Could not preload CUDA DLLs:", e)
+        providers = []
+        try:
+            providers = list(ort.get_available_providers())  # e.g., ['CUDAExecutionProvider','CPUExecutionProvider']
+        except Exception:
+            providers = []
+        return True, providers
+    except Exception:
+        return False, []
+
+def get_session_providers(session) -> list[str]:
+    try:
+        return list(session.get_providers())
+    except Exception:
+        return []
+
 @contextmanager
 def suppress_output():
-   with open(os.devnull, 'w') as devnull:
-       old_stdout, old_stderr = sys.stdout, sys.stderr
-       sys.stdout, sys.stderr = devnull, devnull
-       try:
-           yield
-       finally:
-           sys.stdout, sys.stderr = old_stdout, old_stderr
+    with open(os.devnull, 'w') as devnull:
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = devnull, devnull
+        try:
+            yield
+        finally:
+            sys.stdout, sys.stderr = old_stdout, old_stderr
 
-def initialize_faceanalysis_and_swapper() -> tuple[FaceAnalysis, insightface.model_zoo.model_zoo.INSwapper]:
-   faceanalysis: FaceAnalysis = FaceAnalysis(name="buffalo_l")
-   faceanalysis.prepare(ctx_id=0, det_size=(640, 640))
-   swapper: insightface.model_zoo.model_zoo.INSwapper = insightface.model_zoo.get_model('inswapper_128.onnx', download=False, download_zip=False)
-   return faceanalysis, swapper
+def initialize_faceanalysis_and_swapper(det_size=(640, 640), ctx_id: int = 0, swapper_providers: list[str] | None = None):
+    faceanalysis = FaceAnalysis(name="buffalo_l")
+    faceanalysis.prepare(ctx_id=ctx_id, det_size=det_size)
+    swapper = insightface.model_zoo.get_model('inswapper_128.onnx', download=False, download_zip=False)
+    if swapper_providers:
+        try:
+            import onnxruntime as ort  # noqa: F401
+            sess = getattr(swapper, 'session', None) or getattr(swapper, 'model', None)
+            if sess and hasattr(sess, 'set_providers'):
+                sess.set_providers(swapper_providers)
+        except Exception:
+            pass
+    return faceanalysis, swapper
 
 def get_video_fps(video_path: str) -> float:
-   cap = VideoCapture(video_path)
-   fps = cap.get(CAP_PROP_FPS)
-   cap.release()
-   return fps
+    cap = VideoCapture(video_path)
+    fps = cap.get(CAP_PROP_FPS)
+    cap.release()
+    return fps
 
 def extract_frames(video_path: str):
-   """Extract all frames to unprocessed_frames/"""
-   os.makedirs('unprocessed_frames', exist_ok=True)
-   run([
-       'ffmpeg', '-i', video_path,
-       '-q:v', '2',
-       'unprocessed_frames/frame_%04d.png'
-   ], check=True, capture_output=True)
+    """Extract all frames to unprocessed_frames/"""
+    UNPROCESSED_DIR.mkdir(exist_ok=True)
+    run([
+        'ffmpeg', '-y', '-loglevel', 'error',
+        '-i', video_path,
+        '-q:v', '2',
+        str(UNPROCESSED_DIR / 'frame_%04d.png')
+    ], check=True)
 
 def extract_audio(video_path: str) -> str:
-   """Extract audio to audio.aac"""
-   run([
-       'ffmpeg', '-i', video_path,
-       '-map', '0:a', '-acodec', 'copy',
-       'audio.aac'
-   ], check=True, capture_output=True)
-   return 'audio.aac'
+    """Extract audio to audio.aac"""
+    run([
+        'ffmpeg', '-y', '-loglevel', 'error',
+        '-i', video_path,
+        '-map', '0:a', '-acodec', 'copy',
+        'audio.aac'
+    ], check=True)
+    return 'audio.aac'
 
 def reconstruct_video(fps: float, audio_path: str, output_path: str):
-   """Combine processed frames with audio"""
-   os.makedirs('processed_frames', exist_ok=True)
-   run([
-       'ffmpeg', '-framerate', str(fps),
-       '-i', 'processed_frames/frame_%04d.png',
-       '-i', audio_path,
-       '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
-       '-c:a', 'copy', '-shortest',
-       output_path
-   ], check=True, capture_output=True)
+    """Combine processed frames with audio"""
+    PROCESSED_DIR.mkdir(exist_ok=True)
+    run([
+        'ffmpeg', '-y', '-loglevel', 'error',
+        '-framerate', str(fps),
+        '-i', str(PROCESSED_DIR / 'frame_%04d.png'),
+        '-i', audio_path,
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+        '-c:a', 'copy', '-shortest',
+        output_path
+    ], check=True)
 
 def cleanup(audio_path: str):
-   """Remove intermediate files"""
-   rmtree('unprocessed_frames', ignore_errors=True)
-   rmtree('processed_frames', ignore_errors=True)
-   if os.path.exists(audio_path):
-       os.remove(audio_path)
+    """Remove intermediate files"""
+    rmtree(UNPROCESSED_DIR, ignore_errors=True)
+    rmtree(PROCESSED_DIR, ignore_errors=True)
+    if os.path.exists(audio_path):
+        os.remove(audio_path)
 
-def kirkify_frame(frame_path: str, output_path: str, faceanalysis: FaceAnalysis, swapper: insightface.model_zoo.model_zoo.INSwapper, kirk_face):
-   """Process a single frame"""
-   img = imread(frame_path)
-   faces = faceanalysis.get(img)
-   
-   if faces:  # Only process if faces detected
-       res = img.copy()
-       for face in faces:
-           res = swapper.get(res, face, kirk_face, paste_back=True)
-       
-       imwrite(output_path, res)
-       return True
-   else:
-       # Copy unchanged if no faces
-       imwrite(output_path, img)
-       return False
+def get_random_kirk_face(faceanalysis: FaceAnalysis):
+    """Get a random Kirk face, ensuring it has a detected face"""
+    for _ in range(3):  # Try up to 3 times
+        kirk_path = KIRKS_DIR / f'kirk_{randint(0, 2)}.jpg'
+        kirk_img = imread(str(kirk_path))
+        faces = faceanalysis.get(kirk_img)
+        if faces:
+            return faces[0]
+    raise RuntimeError("Could not detect a face in any Kirk image")
 
+def kirkify_frame(frame_path: str, output_path: str, faceanalysis: FaceAnalysis, swapper, kirk_face):
+    """Process a single frame"""
+    img = imread(frame_path)
+    if img is None:
+        raise FileNotFoundError(f"Could not read image: {frame_path}")
+    faces = faceanalysis.get(img)
 
-def process_all_frames(faceanalysis: FaceAnalysis, swapper: insightface.model_zoo.model_zoo.INSwapper):
-    """Process each frame in unprocessed_frames/ with tqdm progress bar"""
-    os.makedirs('processed_frames', exist_ok=True)
-    frame_files = [f for f in sorted(os.listdir('unprocessed_frames')) if f.endswith('.png')]
-    kirk = imread(f'kirks/kirk_{randint(0, 2)}.jpg')
-    kirk_face = faceanalysis.get(kirk)[0]
-    # tqdm progress bar
-    for filename in tqdm(frame_files, desc="Processing frames", unit="frame"):
-        input_path = f'unprocessed_frames/{filename}'
-        output_path = f'processed_frames/{filename}'
-        kirkify_frame(input_path, output_path, faceanalysis, swapper, kirk_face)
+    if faces:  # Only process if faces detected
+        res = img.copy()
+        for face in faces:
+            res = swapper.get(res, face, kirk_face, paste_back=True)
+        
+        import numpy as np
+        if not isinstance(res, np.ndarray):
+            res = np.array(res)
+        imwrite(output_path, res)
+        return True
+    else:
+        import numpy as np
+        if not isinstance(img, np.ndarray):
+            img = np.array(img)
+        imwrite(output_path, img)
+        return False
 
-def kirkify_video(TARGET_PATH, OUTPUT_PATH):
-    print("Initializing models...")
-    with suppress_output():
-        FACE_ANALYSIS, FACE_SWAPPER = initialize_faceanalysis_and_swapper()
+def process_all_frames(faceanalysis: FaceAnalysis, swapper, frame_step: int = 1, workers: int | None = None) -> dict:
+    """Process each frame in unprocessed_frames/ with tqdm progress bar
+    - frame_step: process 1 of every N frames (skip to speed up)
+    - workers: number of threads for parallel processing
+    """
+    PROCESSED_DIR.mkdir(exist_ok=True)
+    all_files = sorted([f for f in os.listdir(UNPROCESSED_DIR) if f.endswith('.png')])
+    frame_files = all_files[::max(1, frame_step)]
+    kirk_face = get_random_kirk_face(faceanalysis)
 
+    def _process(idx_and_name: tuple[int, str]) -> bool:
+        idx, filename = idx_and_name
+        input_path = str(UNPROCESSED_DIR / filename)
+        # Renumber output to be contiguous: frame_0000, 0001, ...
+        output_path = str(PROCESSED_DIR / f"frame_{idx:04d}.png")
+        return kirkify_frame(input_path, output_path, faceanalysis, swapper, kirk_face)
+
+    total = len(frame_files)
+    workers = workers or max(1, os.cpu_count() or 1)
+    with_faces = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(_process, (i, fn)) for i, fn in enumerate(frame_files)]
+        for fut in tqdm(as_completed(futures), total=total, desc="Processing frames", unit="frame"):
+            try:
+                if fut.result():
+                    with_faces += 1
+            except Exception:
+                # If a frame fails, count it as no-face and continue
+                pass
+
+    return {'total': len(all_files), 'processed': len(frame_files), 'with_faces': with_faces}
+
+def kirkify_video(TARGET_PATH, OUTPUT_PATH, FACE_ANALYSIS, FACE_SWAPPER, frame_step: int = 1, workers: int | None = None):
     print("Extracting frames...")
     extract_frames(TARGET_PATH)
     
@@ -114,7 +203,8 @@ def kirkify_video(TARGET_PATH, OUTPUT_PATH):
     AUDIO_PATH = extract_audio(TARGET_PATH)
     
     print("Processing frames...")
-    process_all_frames(FACE_ANALYSIS, FACE_SWAPPER)
+    stats = process_all_frames(FACE_ANALYSIS, FACE_SWAPPER, frame_step=frame_step, workers=workers)
+    print(f"  Frames: total {stats['total']}, processed {stats['processed']}, with faces {stats['with_faces']}")
     
     print("Reconstructing video...")
     FPS = get_video_fps(TARGET_PATH)
@@ -125,13 +215,8 @@ def kirkify_video(TARGET_PATH, OUTPUT_PATH):
     
     print(f"Done! Output saved to {OUTPUT_PATH}")
 
-def kirkify_image(TARGET_PATH, OUTPUT_PATH):
-    print("Initializing models...")
-    with suppress_output():
-        FACE_ANALYSIS, FACE_SWAPPER = initialize_faceanalysis_and_swapper()
-
-    kirk = imread(f'kirks/kirk_{randint(0, 2)}.jpg')
-    kirk_face = FACE_ANALYSIS.get(kirk)[0]
+def kirkify_image(TARGET_PATH, OUTPUT_PATH, FACE_ANALYSIS, FACE_SWAPPER):
+    kirk_face = get_random_kirk_face(FACE_ANALYSIS)
 
     print("Kirkifying...")
     FACE_DETECTED = kirkify_frame(TARGET_PATH, OUTPUT_PATH, FACE_ANALYSIS, FACE_SWAPPER, kirk_face)
@@ -148,7 +233,7 @@ def main():
         exit()
 
     if len(sys.argv) < 2:
-        print("Usage: python3 kirkify.py <input_media> [output_path]")
+        print("Usage: python3 kirkify.py <input_media> [output_path] [--fast] [--frame-step N] [--workers M]")
         exit(1)
 
     TARGET_PATH = sys.argv[1]
@@ -170,17 +255,64 @@ def main():
     else:
         raise ValueError('Must be an image or video.')
 
-    
     OUTPUT_PATH = sys.argv[2] if len(sys.argv) > 2 else f"output{FILE_EXT}"
+
+    # Performance flags
+    FAST = '--fast' in sys.argv
+    STEP = 1
+    WORKERS = None
+    for i, arg in enumerate(sys.argv):
+        if arg == '--frame-step' and i + 1 < len(sys.argv):
+            try:
+                STEP = max(1, int(sys.argv[i+1]))
+            except ValueError:
+                pass
+        if arg == '--workers' and i + 1 < len(sys.argv):
+            try:
+                WORKERS = max(1, int(sys.argv[i+1]))
+            except ValueError:
+                pass
+
+    det = (320, 320) if FAST else (640, 640)
+    # Explicit CPU/GPU selection for FaceAnalysis and ONNX Runtime
+    USE_GPU = '--gpu' in sys.argv
+    USE_CPU = '--cpu' in sys.argv
+    ctx_id = 0 if USE_GPU and not USE_CPU else (-1 if USE_CPU else 0)
+    providers = None
+    if USE_GPU and not USE_CPU:
+        providers = ['CUDAExecutionProvider']
+    elif USE_CPU:
+        providers = ['CPUExecutionProvider']
+
+    # Initialize models once
+    # Pre-check ONNX Runtime availability and CUDA support
+    ok, avail = ort_available_and_providers()
+    if USE_GPU and (not ok or 'CUDAExecutionProvider' not in avail):
+        print("[WARN] --gpu requested, but ONNX Runtime GPU is not available; falling back to CPU.")
+        providers = ['CPUExecutionProvider']
+        ctx_id = -1
+
+    print("Initializing models..." + (" (fast mode)" if FAST else "") + (" [GPU]" if ctx_id == 0 else " [CPU]"))
+    with suppress_output():
+        FACE_ANALYSIS, FACE_SWAPPER = initialize_faceanalysis_and_swapper(det_size=det, ctx_id=ctx_id, swapper_providers=providers)
+
+    # Report active providers for INSwapper
+    sess = getattr(FACE_SWAPPER, 'session', None) or getattr(FACE_SWAPPER, 'model', None)
+    active = get_session_providers(sess) if sess is not None else []
+    if active:
+        print(f"INSwapper active providers: {active}")
+    else:
+        if providers:
+            print(f"INSwapper active providers unavailable; attempted: {providers}")
 
     try:
         if IS_IMAGE:
-            kirkify_image(TARGET_PATH, OUTPUT_PATH)
+            kirkify_image(TARGET_PATH, OUTPUT_PATH, FACE_ANALYSIS, FACE_SWAPPER)
         else:
-            kirkify_video(TARGET_PATH, OUTPUT_PATH)
+            kirkify_video(TARGET_PATH, OUTPUT_PATH, FACE_ANALYSIS, FACE_SWAPPER, frame_step=STEP, workers=WORKERS)
     except KeyboardInterrupt:
         cleanup('audio.aac')
         print("Goodbye!")
 
 if __name__ == "__main__":
-   main()
+    main()
