@@ -109,12 +109,12 @@ def extract_audio(video_path: str) -> str:
     ], check=True)
     return 'audio.aac'
 
-def reconstruct_video(fps: float, audio_path: str, output_path: str):
+def reconstruct_video(fps: float, audio_path: str, output_path: str, frame_step: int):
     """Combine processed frames with audio"""
     PROCESSED_DIR.mkdir(exist_ok=True)
     run([
         'ffmpeg', '-y', '-loglevel', 'error',
-        '-framerate', str(fps),
+        '-framerate', str(fps / frame_step),
         '-i', str(PROCESSED_DIR / 'frame_%04d.png'),
         '-i', audio_path,
         '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
@@ -208,7 +208,7 @@ def kirkify_video(TARGET_PATH, OUTPUT_PATH, FACE_ANALYSIS, FACE_SWAPPER, frame_s
     
     print("Reconstructing video...")
     FPS = get_video_fps(TARGET_PATH)
-    reconstruct_video(FPS, AUDIO_PATH, OUTPUT_PATH)
+    reconstruct_video(FPS, AUDIO_PATH, OUTPUT_PATH, frame_step)
     
     print("Cleaning up...")
     cleanup(AUDIO_PATH)
@@ -255,7 +255,10 @@ def main():
     else:
         raise ValueError('Must be an image or video.')
 
-    OUTPUT_PATH = sys.argv[2] if len(sys.argv) > 2 else f"output{FILE_EXT}"
+    if len(sys.argv) > 2 and not sys.argv[2].startswith('-'):
+        OUTPUT_PATH = sys.argv[2]
+    else:
+        OUTPUT_PATH = f"output{FILE_EXT}"
 
     # Performance flags
     FAST = '--fast' in sys.argv
